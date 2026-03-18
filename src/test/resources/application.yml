@@ -1,0 +1,12 @@
+spring:
+  application:
+    name: grpc-observability-demo-test
+  grpc:
+    server:
+      port: 9090
+
+otel:
+  traces:
+    exporter: none
+  service:
+    name: grpc-observability-demo-test

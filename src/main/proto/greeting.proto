@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package greeting;
+
+option java_multiple_files = true;
+option java_package = "com.example.grpcobservability.proto";
+option java_outer_classname = "GreetingProto";
+
+service GreetingService {
+  rpc Greet (GreetRequest) returns (GreetResponse);
+  rpc GreetStream (GreetRequest) returns (stream GreetResponse);
+}
+
+message GreetRequest {
+  string name = 1;
+  string tenant_id = 2;
+  string user_id = 3;
+}
+
+message GreetResponse {
+  string message = 1;
+  string request_id = 2;
+}
