@@ -4,6 +4,17 @@ spring:
   grpc:
     server:
       port: 9090
+      observation:
+        enabled: true
+
+management:
+  observations:
+    annotations:
+      enabled: true
+  metrics:
+    distribution:
+      percentiles-histogram:
+        grpc.server: true
 
 otel:
   traces:

@@ -38,6 +38,7 @@ dependencies {
     // Spring Boot
     implementation("org.springframework.boot:spring-boot-starter")
     implementation("org.springframework.boot:spring-boot-starter-log4j2")
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
 
     // Spring gRPC
     implementation("org.springframework.grpc:spring-grpc-spring-boot-starter")
@@ -56,6 +57,9 @@ dependencies {
     implementation("io.opentelemetry:opentelemetry-api")
     implementation("io.opentelemetry:opentelemetry-sdk")
     implementation("io.opentelemetry.instrumentation:opentelemetry-spring-boot-starter")
+
+    // Micrometer tracing bridge — connects Spring Observation API to OTel
+    implementation("io.micrometer:micrometer-tracing-bridge-otel")
 
     // Logging
     implementation("io.github.oshai:kotlin-logging-jvm:7.0.3")
