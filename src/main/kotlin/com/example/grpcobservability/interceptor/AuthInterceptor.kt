@@ -8,6 +8,7 @@ import io.grpc.Metadata
 import io.grpc.ServerCall
 import io.grpc.ServerCallHandler
 import io.grpc.ServerInterceptor
+import org.slf4j.MDC
 
 private val logger = KotlinLogging.logger {}
 
@@ -16,6 +17,10 @@ private val logger = KotlinLogging.logger {}
  *
  * Does NOT touch MDC — instead registers a derivation with [MdcProviders] so that
  * [ObservabilityContext] populates MDC from these keys on each coroutine thread switch.
+ *
+ * The debug log temporarily populates MDC with trace IDs (from OTel, already current)
+ * and userId/tenantId (from headers, about to be set in gRPC context) so the log
+ * has full context fields.
  */
 class AuthInterceptor : ServerInterceptor {
 
@@ -50,7 +55,18 @@ class AuthInterceptor : ServerInterceptor {
             .withValue(USER_ID_CTX_KEY, userId)
             .withValue(TENANT_ID_CTX_KEY, tenantId)
 
-        logger.debug { "Auth context: userId=$userId, tenantId=$tenantId" }
+        // OTel span is current (set by OtelGrpcInterceptor upstream). Populate MDC
+        // with trace IDs + the userId/tenantId we just extracted for this debug log.
+        OtelGrpcInterceptor.logWithSpanContext {
+            MDC.put("userId", userId)
+            MDC.put("tenantId", tenantId)
+            try {
+                logger.debug { "Auth context: userId=$userId, tenantId=$tenantId" }
+            } finally {
+                MDC.remove("userId")
+                MDC.remove("tenantId")
+            }
+        }
 
         return Contexts.interceptCall(grpcContext, call, headers, next)
     }

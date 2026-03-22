@@ -7,12 +7,14 @@ import io.grpc.Metadata
 import io.grpc.ServerCall
 import io.grpc.ServerCallHandler
 import io.grpc.ServerInterceptor
+import io.opentelemetry.api.trace.Span
 import io.opentelemetry.api.trace.SpanKind
 import io.opentelemetry.api.trace.StatusCode
 import io.opentelemetry.api.trace.Tracer
 import io.opentelemetry.context.Context
 import io.opentelemetry.context.propagation.TextMapGetter
 import io.opentelemetry.context.propagation.TextMapPropagator
+import org.slf4j.MDC
 import java.util.concurrent.atomic.AtomicBoolean
 
 private val logger = KotlinLogging.logger {}
@@ -63,7 +65,9 @@ class OtelGrpcInterceptor(
         val spanContext = extractedContext.with(span)
         val scope = spanContext.makeCurrent()
 
-        logger.debug { "Started span for ${call.methodDescriptor.fullMethodName}" }
+        // Temporarily populate MDC with trace context for this debug log.
+        // AuthInterceptor hasn't run yet, so only trace/span IDs are available.
+        logWithSpanContext { logger.debug { "Started span for ${call.methodDescriptor.fullMethodName}" } }
 
         // Guard against double-close: both close() and onCancel() can fire in edge cases
         val ended = AtomicBoolean(false)
@@ -92,6 +96,23 @@ class OtelGrpcInterceptor(
             override fun onCancel() {
                 endSpan(StatusCode.ERROR, "Cancelled")
                 super.onCancel()
+            }
+        }
+    }
+
+    companion object {
+        /** Temporarily populate MDC with OTel trace/span IDs for a log call. */
+        internal inline fun logWithSpanContext(block: () -> Unit) {
+            val spanCtx = Span.current().spanContext
+            if (spanCtx.isValid) {
+                MDC.put("trace.id", spanCtx.traceId)
+                MDC.put("span.id", spanCtx.spanId)
+            }
+            try {
+                block()
+            } finally {
+                MDC.remove("trace.id")
+                MDC.remove("span.id")
             }
         }
     }
