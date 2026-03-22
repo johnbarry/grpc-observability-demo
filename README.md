@@ -147,18 +147,20 @@ The key insight: **interceptors only manage their own native context**. The `Ote
 
 ### What the logging interceptor produces
 
-For a successful call:
+For a successful call (note the trace ID and user context in the log prefix):
 ```
-INFO  LoggingInterceptor - gRPC START greeting.GreetingService/Greet
-INFO  LoggingInterceptor - gRPC END   greeting.GreetingService/Greet — OK (35ms)
+INFO  [abc123,def456] [alice,acme] LoggingInterceptor - gRPC START greeting.GreetingService/Greet
+INFO  [abc123,def456] [alice,acme] LoggingInterceptor - gRPC END   greeting.GreetingService/Greet — OK (35ms)
 ```
 
 For a call whose response contains an `Error` with non-2xx `http_code`, the interceptor logs the error when the message is sent (`gRPC MSG`) and again in the end summary (`gRPC END`):
 ```
-INFO  LoggingInterceptor - gRPC START greeting.GreetingService/Farewell
-WARN  LoggingInterceptor - gRPC MSG   greeting.GreetingService/Farewell — response contains error: httpCode=404 reason="User not found"
-WARN  LoggingInterceptor - gRPC END   greeting.GreetingService/Farewell — FAILED httpCode=404 reason="User not found" (31ms)
+INFO  [abc123,ghi789] [alice,acme] LoggingInterceptor - gRPC START greeting.GreetingService/Farewell
+WARN  [abc123,ghi789] [alice,acme] LoggingInterceptor - gRPC MSG   greeting.GreetingService/Farewell — response contains error: httpCode=404 reason="User not found"
+WARN  [abc123,ghi789] [alice,acme] LoggingInterceptor - gRPC END   greeting.GreetingService/Farewell — FAILED httpCode=404 reason="User not found" (31ms)
 ```
+
+The `LoggingInterceptor` runs on the gRPC transport thread where `ObservabilityContext` hasn't populated MDC yet. It solves this by temporarily deriving MDC entries from the current gRPC Context and OTel Span for each log call — using the same `MdcProviders` registry that `ObservabilityContext` uses — then cleaning up afterwards.
 
 For streaming RPCs, every message is inspected individually. If any message carries an error, the per-message `gRPC MSG` log fires immediately, and the `gRPC END` summary reports the last error seen.
 
@@ -231,11 +233,12 @@ src/main/kotlin/com/example/grpcobservability/
     AuthInterceptor.kt        -- Extracts x-user-id and x-tenant-id from gRPC headers,
                                  stores in gRPC Context. Registers an MdcProvider so
                                  ObservabilityContext knows how to derive MDC from these.
-    LoggingInterceptor.kt     -- Logs start/end of every gRPC call. Inspects every
-                                 response message (unary and streaming) for an Error
-                                 field with non-2xx http_code. Logs per-message at WARN
-                                 and summarizes in the END log. Uses protobuf descriptors
-                                 so it works generically across any response type.
+    LoggingInterceptor.kt     -- Logs start/end of every gRPC call with full context
+                                 (trace ID, span ID, userId, tenantId) by temporarily
+                                 deriving MDC from the current gRPC/OTel contexts.
+                                 Inspects every response message (unary and streaming)
+                                 for an Error field with non-2xx http_code. Uses protobuf
+                                 descriptors so it works generically across response types.
   service/
     GreetingServiceImpl.kt    -- The gRPC service (Greet, Farewell, GreetStream).
                                  Unary methods delegate to a shared handleUnary() that

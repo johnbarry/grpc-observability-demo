@@ -1,5 +1,6 @@
 package com.example.grpcobservability.interceptor
 
+import com.example.grpcobservability.context.MdcProviders
 import com.google.protobuf.Message
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.grpc.ForwardingServerCall.SimpleForwardingServerCall
@@ -9,13 +10,21 @@ import io.grpc.ServerCall
 import io.grpc.ServerCallHandler
 import io.grpc.ServerInterceptor
 import io.grpc.Status
+import io.opentelemetry.api.trace.Span
+import org.slf4j.MDC
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import io.grpc.Context as GrpcContext
 
 private val logger = KotlinLogging.logger {}
 
 /**
  * Logs the start and end of every gRPC method call.
+ *
+ * Because this interceptor runs on the gRPC transport thread (not inside a coroutine),
+ * MDC is not populated by ObservabilityContext. Instead, this interceptor derives MDC
+ * entries directly from the current gRPC Context and OTel Span for each log call,
+ * using the same MdcProviders registry that ObservabilityContext uses.
  *
  * On each response message (unary or streaming), inspects the protobuf for an `error`
  * field. If the error is present and its `http_code` is outside the 2xx range, the
@@ -37,7 +46,7 @@ class LoggingInterceptor : ServerInterceptor {
         val messageIndex = AtomicInteger(0)
         val lastError = AtomicReference<ErrorInfo?>(null)
 
-        logger.info { "gRPC START $methodName" }
+        logWithContext { logger.info { "gRPC START $methodName" } }
 
         val wrappedCall = object : SimpleForwardingServerCall<ReqT, RespT>(call) {
 
@@ -47,9 +56,11 @@ class LoggingInterceptor : ServerInterceptor {
                 if (errorResult != null) {
                     lastError.set(errorResult)
                     val suffix = if (call.methodDescriptor.type.serverSendsOneMessage()) "" else " [message #$idx]"
-                    logger.warn {
-                        "gRPC MSG   $methodName$suffix — response contains error: " +
-                            "httpCode=${errorResult.httpCode} reason=\"${errorResult.reason}\""
+                    logWithContext {
+                        logger.warn {
+                            "gRPC MSG   $methodName$suffix — response contains error: " +
+                                "httpCode=${errorResult.httpCode} reason=\"${errorResult.reason}\""
+                        }
                     }
                 }
                 super.sendMessage(message)
@@ -59,21 +70,23 @@ class LoggingInterceptor : ServerInterceptor {
                 val durationMs = (System.nanoTime() - startNanos) / 1_000_000
                 val error = lastError.get()
 
-                when {
-                    !status.isOk -> {
-                        logger.warn {
-                            "gRPC END   $methodName — gRPC status=${status.code} " +
-                                "description=\"${status.description ?: ""}\" (${durationMs}ms)"
+                logWithContext {
+                    when {
+                        !status.isOk -> {
+                            logger.warn {
+                                "gRPC END   $methodName — gRPC status=${status.code} " +
+                                    "description=\"${status.description ?: ""}\" (${durationMs}ms)"
+                            }
                         }
-                    }
-                    error != null -> {
-                        logger.warn {
-                            "gRPC END   $methodName — FAILED " +
-                                "httpCode=${error.httpCode} reason=\"${error.reason}\" (${durationMs}ms)"
+                        error != null -> {
+                            logger.warn {
+                                "gRPC END   $methodName — FAILED " +
+                                    "httpCode=${error.httpCode} reason=\"${error.reason}\" (${durationMs}ms)"
+                            }
                         }
-                    }
-                    else -> {
-                        logger.info { "gRPC END   $methodName — OK (${durationMs}ms)" }
+                        else -> {
+                            logger.info { "gRPC END   $methodName — OK (${durationMs}ms)" }
+                        }
                     }
                 }
 
@@ -86,9 +99,33 @@ class LoggingInterceptor : ServerInterceptor {
         return object : SimpleForwardingServerCallListener<ReqT>(listener) {
             override fun onCancel() {
                 val durationMs = (System.nanoTime() - startNanos) / 1_000_000
-                logger.warn { "gRPC END   $methodName — CANCELLED (${durationMs}ms)" }
+                logWithContext { logger.warn { "gRPC END   $methodName — CANCELLED (${durationMs}ms)" } }
                 super.onCancel()
             }
+        }
+    }
+
+    /**
+     * Temporarily populates MDC from the current gRPC Context and OTel Span,
+     * executes the logging block, then cleans up. This ensures interceptor-thread
+     * logs have the same context fields as coroutine-thread logs.
+     */
+    private inline fun logWithContext(block: () -> Unit) {
+        val entries = buildMdcEntries()
+        entries.forEach { (k, v) -> MDC.put(k, v) }
+        try {
+            block()
+        } finally {
+            entries.keys.forEach { MDC.remove(it) }
+        }
+    }
+
+    private fun buildMdcEntries(): Map<String, String> = buildMap {
+        putAll(MdcProviders.deriveFrom(GrpcContext.current()))
+        val spanCtx = Span.current().spanContext
+        if (spanCtx.isValid) {
+            put("trace.id", spanCtx.traceId)
+            put("span.id", spanCtx.spanId)
         }
     }
 
