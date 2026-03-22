@@ -12,7 +12,7 @@
         <Logger name="org.springframework.grpc" level="WARN"/>
         <Logger name="io.grpc" level="WARN"/>
         <Root level="INFO">
-            <AppenderRef ref="${env:LOG_FORMAT:-PLAIN}"/>
+            <AppenderRef ref="${env:LOG_FORMAT:-JSON}"/>
         </Root>
     </Loggers>
 </Configuration>

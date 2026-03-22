@@ -5,11 +5,11 @@ A Spring Boot 4.0 / Kotlin project that solves a deceptively hard problem: makin
 ## How to Run
 
 ```bash
-# Plain text logging (default)
-LOG_FORMAT=PLAIN ./gradlew bootRun
+# ECS JSON logging (default — Elasticsearch-compatible)
+./gradlew bootRun
 
-# JSON (ECS) logging for production (Elasticsearch-compatible)
-LOG_FORMAT=JSON ./gradlew bootRun
+# Plain text logging (for local development)
+LOG_FORMAT=PLAIN ./gradlew bootRun
 
 # Run tests
 ./gradlew test
