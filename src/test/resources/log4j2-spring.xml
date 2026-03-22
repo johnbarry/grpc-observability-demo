@@ -4,15 +4,12 @@
         <Console name="PLAIN" target="SYSTEM_OUT">
             <PatternLayout pattern="%d{HH:mm:ss.SSS} %-5level [%X{trace.id},%X{span.id}] [%X{userId},%X{tenantId}] [%X{requestId}] %logger{36} - %msg%n"/>
         </Console>
-        <Console name="JSON" target="SYSTEM_OUT">
-            <EcsLayout serviceName="grpc-observability-demo-test"/>
-        </Console>
     </Appenders>
     <Loggers>
         <Logger name="org.springframework.grpc" level="WARN"/>
         <Logger name="io.grpc" level="WARN"/>
         <Root level="DEBUG">
-            <AppenderRef ref="${env:LOG_FORMAT:-JSON}"/>
+            <AppenderRef ref="PLAIN"/>
         </Root>
     </Loggers>
 </Configuration>
