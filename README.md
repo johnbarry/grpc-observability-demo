@@ -86,7 +86,16 @@ Client sends gRPC request with headers:
         |
         v
 
-  OtelGrpcInterceptor (runs first)
+  ObservationGrpcServerInterceptor (@Order(0), auto-configured)
+    - Creates a Micrometer Observation for the call
+    - Produces grpc.server timer metrics and OTel spans via the bridge
+    - Closes the observation when the call ends (via ServerCall.close()
+      or ServerCall.Listener.onCancel())
+
+        |
+        v
+
+  OtelGrpcInterceptor (@Order(1), manual)
     - Reads "traceparent" header
     - Creates an OTel Span and makes it the current span (thread-local)
     - Does NOT write to MDC
@@ -94,7 +103,7 @@ Client sends gRPC request with headers:
         |
         v
 
-  AuthInterceptor (runs second)
+  AuthInterceptor (@Order(2), manual)
     - Reads "x-user-id" and "x-tenant-id" headers
     - Stores them as gRPC Context keys (thread-local)
     - Does NOT write to MDC
@@ -102,7 +111,16 @@ Client sends gRPC request with headers:
         |
         v
 
-  GreetingServiceImpl.greet()
+  LoggingInterceptor (@Order(3), manual)
+    - Logs "gRPC START {method}" at INFO
+    - Wraps ServerCall.sendMessage() to capture the response protobuf
+    - On close: inspects response for an Error field with non-2xx http_code
+    - Logs "gRPC END {method} — OK" at INFO, or failure details at WARN
+
+        |
+        v
+
+  GreetingServiceImpl.greet() / farewell()
     - Calls responseObserver.respondWith { ... }
     - respondWith captures an ObservabilityContext snapshot
       (records the current gRPC Context + OTel Context)
@@ -124,7 +142,31 @@ Client sends gRPC request with headers:
   Log4j2 reads MDC → every log line has userId, tenantId, trace.id
 ```
 
-The key insight: **interceptors only manage their own native context**. The `OtelGrpcInterceptor` manages OTel spans. The `AuthInterceptor` manages gRPC Context keys. Neither one writes to MDC. MDC is populated by `ObservabilityContext` as a derived view — recomputed fresh on every thread switch.
+The key insight: **interceptors only manage their own native context**. The `OtelGrpcInterceptor` manages OTel spans. The `AuthInterceptor` manages gRPC Context keys. The `LoggingInterceptor` only reads response data — it doesn't modify any context. None of them write to MDC. MDC is populated by `ObservabilityContext` as a derived view — recomputed fresh on every thread switch.
+
+### What the logging interceptor produces
+
+For a successful call:
+```
+INFO  LoggingInterceptor - gRPC START greeting.GreetingService/Greet
+INFO  LoggingInterceptor - gRPC END   greeting.GreetingService/Greet — OK (35ms)
+```
+
+For a call whose response contains an `Error` with non-2xx `http_code`:
+```
+INFO  LoggingInterceptor - gRPC START greeting.GreetingService/Farewell
+WARN  LoggingInterceptor - gRPC END   greeting.GreetingService/Farewell — response contains error: httpCode=404 reason="User not found" (31ms)
+```
+
+Note that both calls succeeded at the gRPC transport level — the `LoggingInterceptor` looks inside the response protobuf to detect domain-level failures. This is important because many monitoring systems only look at gRPC status codes, which would miss these business errors entirely.
+
+### How gRPC interceptors manage lifecycle (not just start)
+
+A common misconception is that gRPC interceptors only fire at the start of a call. In fact, `interceptCall()` returns a `ServerCall.Listener` and receives a `ServerCall` — the interceptor can wrap both to hook into the **full call lifecycle**:
+
+- **`ServerCall.sendMessage()`** — called when the server sends a response. The `LoggingInterceptor` overrides this to capture the response protobuf for inspection.
+- **`ServerCall.close(Status, Metadata)`** — called when the call ends. This is where the `LoggingInterceptor` logs the end of the call, and where the `ObservationGrpcServerInterceptor` stops its observation (recording the timer and closing the span).
+- **`ServerCall.Listener.onCancel()`** — called if the client cancels. Both the `LoggingInterceptor` and `OtelGrpcInterceptor` use this to handle premature termination.
 
 ### Why derive MDC instead of propagating it independently?
 
@@ -136,9 +178,36 @@ The common approach is to have interceptors write to MDC directly, then use a se
 
 By deriving MDC from the other contexts on every thread attach, we eliminate all of these issues. MDC is always consistent with the actual state of the gRPC and OTel contexts.
 
+### The protobuf schema
+
+The service is defined in `src/main/proto/greeting.proto`:
+
+```protobuf
+service GreetingService {
+  rpc Greet (GreetRequest) returns (GreetResponse);        // unary
+  rpc Farewell (FarewellRequest) returns (FarewellResponse); // unary
+  rpc GreetStream (GreetRequest) returns (stream GreetResponse); // server streaming
+}
+```
+
+Both unary responses include an `optional Error error` field:
+
+```protobuf
+message Error {
+  int32 http_code = 1;   // e.g. 404, 500
+  string reason = 2;     // human-readable explanation
+}
+```
+
+This is a domain-level error — separate from the gRPC transport status. A call can succeed at the gRPC level (status `OK`) but still carry a business error in the response body. The `LoggingInterceptor` detects this pattern: it inspects every response protobuf for an `error` field, and if the `http_code` is outside the 2xx range, it logs the call as a failure at WARN level.
+
 ### File-by-file guide
 
 ```
+src/main/proto/
+  greeting.proto              -- Service definition with 3 RPCs (Greet, Farewell,
+                                 GreetStream). Response messages carry optional Error.
+
 src/main/kotlin/com/example/grpcobservability/
   context/
     ObservabilityContext.kt   -- The single ThreadContextElement that propagates
@@ -154,13 +223,20 @@ src/main/kotlin/com/example/grpcobservability/
     AuthInterceptor.kt        -- Extracts x-user-id and x-tenant-id from gRPC headers,
                                  stores in gRPC Context. Registers an MdcProvider so
                                  ObservabilityContext knows how to derive MDC from these.
+    LoggingInterceptor.kt     -- Logs start/end of every gRPC call. Inspects response
+                                 protobufs for an Error field with non-2xx http_code
+                                 and logs failures at WARN. Uses protobuf descriptors
+                                 so it works generically across any response type.
   service/
-    GreetingServiceImpl.kt    -- The gRPC service. Uses respondWith/streamWith to handle
-                                 requests in coroutines with full context propagation.
+    GreetingServiceImpl.kt    -- The gRPC service (Greet, Farewell, GreetStream).
+                                 Uses respondWith/streamWith to handle requests in
+                                 coroutines with full context propagation. Sets the
+                                 Error field for specific test inputs (name="error"
+                                 triggers 500, name="unknown" triggers 404).
   config/
-    GrpcConfig.kt             -- Registers the two manual interceptors as Spring beans.
-                                 (ObservationGrpcServerInterceptor is auto-configured
-                                 separately by Spring gRPC + Actuator.)
+    GrpcConfig.kt             -- Registers the three manual interceptors as Spring beans
+                                 at @Order(1), @Order(2), @Order(3). The auto-configured
+                                 ObservationGrpcServerInterceptor runs at @Order(0).
 ```
 
 #### Dependencies for auto-instrumentation
@@ -243,15 +319,37 @@ The `grpc-kotlin` project can generate coroutine-based service stubs where each 
 
 ## What Each Test Proves
 
-### `GreetingServiceIntegrationTest` (3 tests, full Spring Boot context)
+### `GreetingServiceIntegrationTest` (10 tests, full Spring Boot context)
 
 These tests start the actual gRPC server and make real gRPC calls to it.
+
+#### Context propagation (3 tests)
 
 **`testGreetPopulatesFullContext`** — Sends a unary gRPC call with a known `traceparent` header (containing trace ID `0af765...`), `x-user-id`, and `x-tenant-id`. Asserts that the response is correct, and that an OTel span was exported with a trace ID matching the one we sent. This proves end-to-end trace propagation: client header -> interceptor -> OTel span -> exporter.
 
 **`testGreetStreamPropagatesContext`** — Sends a server-streaming call and collects all 5 responses. Asserts that all responses arrive and that a span with the correct trace ID is exported. This proves context propagation works for streaming RPCs (not just unary).
 
 **`testContextPropagationAcrossDispatcherSwitch`** — The most important test. Installs a custom Log4j2 appender that captures `LogEvent` objects into a queue. Makes a gRPC call, then inspects the captured log events for the ones emitted from `Dispatchers.IO` — both **before** and **after** a `delay()`. Asserts that `userId`, `tenantId`, and `trace.id` are present in the MDC of those log events. This proves that all three context systems survive a dispatcher switch AND a suspension/resumption on a potentially different thread within the IO pool.
+
+#### Farewell method and Error field (3 tests)
+
+**`testFarewellReturnsSuccessResponse`** — Calls the `Farewell` RPC with a normal name. Asserts the goodbye message is correct, the `requestId` is populated, and the `error` field is **not** set. Proves the happy path for the second unary method.
+
+**`testFarewellReturnsErrorForUnknownUser`** — Calls `Farewell` with name `"unknown"`. Asserts the `error` field is present with `http_code=404` and `reason="User not found"`. Proves the domain-level error convention works — the gRPC call itself succeeds (status OK) but the response body carries a business error.
+
+**`testGreetReturnsErrorForErrorName`** — Calls `Greet` with name `"error"`. Asserts the `error` field is present with `http_code=500` and `reason="Simulated internal error for testing"`.
+
+#### Logging interceptor (4 tests)
+
+These tests install a custom Log4j2 appender to capture log events, make gRPC calls, then assert that the `LoggingInterceptor` produced the expected log entries.
+
+**`testLoggingInterceptorLogsStartAndEndForSuccessfulCall`** — Calls `Greet` with a normal name. Asserts that both a `"gRPC START greeting.GreetingService/Greet"` log and a `"gRPC END ... OK"` log were emitted.
+
+**`testLoggingInterceptorLogsFailureForErrorResponse`** — Calls `Greet` with name `"error"`, which returns a response with `http_code=500`. Asserts that the end log contains `httpCode=500` and was emitted at `WARN` level (not INFO).
+
+**`testLoggingInterceptorLogsFarewellStartAndEnd`** — Same as the first logging test but for the `Farewell` method. Asserts START/END logs contain `GreetingService/Farewell`.
+
+**`testLoggingInterceptorLogsFarewellFailure`** — Calls `Farewell` with name `"unknown"` (404 error). Asserts the end log contains `httpCode=404` at WARN level.
 
 ### `MdcCoroutineTest` (4 tests, no Spring, pure unit tests)
 
@@ -293,7 +391,8 @@ These tests verify that Spring gRPC's built-in `ObservationGrpcServerInterceptor
 | **traceparent** | A W3C standard HTTP header (`00-{traceId}-{spanId}-{flags}`) that carries trace context between services. Our `OtelGrpcInterceptor` reads this from gRPC metadata. |
 | **Dispatcher** | In Kotlin coroutines, the thread pool a coroutine runs on. `Dispatchers.Default` is for CPU work, `Dispatchers.IO` is for blocking I/O. `withContext(Dispatchers.IO)` switches the coroutine to the IO pool. |
 | **suspend / resume** | When a coroutine calls `delay()` or another suspending function, it **suspends** — it pauses and frees its thread. Later it **resumes**, possibly on a different thread. This is when context can be lost. |
-| **Interceptor** | gRPC middleware. Runs before/after your service code. Used here to extract headers into context objects. Similar to servlet filters or Spring `HandlerInterceptor`. |
+| **Interceptor** | gRPC middleware. Wraps the `ServerCall` and `ServerCall.Listener` to hook into the full call lifecycle (start, message, close, cancel). Used here to extract headers, log calls, and create spans. Similar to servlet filters or Spring `HandlerInterceptor`. |
+| **Domain error vs transport error** | gRPC has its own status codes (OK, INTERNAL, NOT_FOUND, etc.) at the transport level. This project also uses a protobuf `Error` message inside the response body for domain-level errors — a call can succeed at the transport level (gRPC status OK) but carry a business error (e.g. `http_code=404`) in the response. The `LoggingInterceptor` detects this pattern. |
 | **MdcProviders** | Our registry where interceptors declare how their gRPC Context keys map to MDC fields. `ObservabilityContext` calls all registered providers on each thread switch. |
 | **Observation** | A Micrometer concept that represents a unit of work. An observation produces both metrics (timers, counters) and traces (spans) from a single instrumentation point. Spring gRPC's `ObservationGrpcServerInterceptor` creates one observation per gRPC call. |
 | **ObservationRegistry** | The central Micrometer registry that manages observations. Provided by `spring-boot-starter-actuator`. Observation handlers attached to it determine what gets produced (metrics, traces, or both). |

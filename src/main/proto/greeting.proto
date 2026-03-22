@@ -8,7 +8,13 @@ option java_outer_classname = "GreetingProto";
 
 service GreetingService {
   rpc Greet (GreetRequest) returns (GreetResponse);
+  rpc Farewell (FarewellRequest) returns (FarewellResponse);
   rpc GreetStream (GreetRequest) returns (stream GreetResponse);
+}
+
+message Error {
+  int32 http_code = 1;
+  string reason = 2;
 }
 
 message GreetRequest {
@@ -20,4 +26,17 @@ message GreetRequest {
 message GreetResponse {
   string message = 1;
   string request_id = 2;
+  optional Error error = 3;
+}
+
+message FarewellRequest {
+  string name = 1;
+  string tenant_id = 2;
+  string user_id = 3;
+}
+
+message FarewellResponse {
+  string message = 1;
+  string request_id = 2;
+  optional Error error = 3;
 }

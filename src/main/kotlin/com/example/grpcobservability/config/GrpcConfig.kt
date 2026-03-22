@@ -1,6 +1,7 @@
 package com.example.grpcobservability.config
 
 import com.example.grpcobservability.interceptor.AuthInterceptor
+import com.example.grpcobservability.interceptor.LoggingInterceptor
 import com.example.grpcobservability.interceptor.OtelGrpcInterceptor
 import io.grpc.ServerInterceptor
 import io.opentelemetry.api.OpenTelemetry
@@ -26,5 +27,12 @@ class GrpcConfig {
     @GlobalServerInterceptor
     fun authInterceptor(): ServerInterceptor {
         return AuthInterceptor()
+    }
+
+    @Bean
+    @Order(3)
+    @GlobalServerInterceptor
+    fun loggingInterceptor(): ServerInterceptor {
+        return LoggingInterceptor()
     }
 }

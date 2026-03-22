@@ -4,6 +4,9 @@ import com.example.grpcobservability.context.respondWith
 import com.example.grpcobservability.context.streamWith
 import com.example.grpcobservability.context.withFields
 import com.example.grpcobservability.interceptor.AuthInterceptor
+import com.example.grpcobservability.proto.Error
+import com.example.grpcobservability.proto.FarewellRequest
+import com.example.grpcobservability.proto.FarewellResponse
 import com.example.grpcobservability.proto.GreetRequest
 import com.example.grpcobservability.proto.GreetResponse
 import com.example.grpcobservability.proto.GreetingServiceGrpc
@@ -41,10 +44,58 @@ class GreetingServiceImpl : GreetingServiceGrpc.GreetingServiceImplBase() {
 
                 logger.info { "Sending greet response for requestId=$requestId" }
 
-                GreetResponse.newBuilder()
+                val builder = GreetResponse.newBuilder()
                     .setMessage("Hello, ${request.name}!")
                     .setRequestId(requestId)
-                    .build()
+
+                // Simulate an error for a specific name
+                if (request.name.equals("error", ignoreCase = true)) {
+                    builder.setError(
+                        Error.newBuilder()
+                            .setHttpCode(500)
+                            .setReason("Simulated internal error for testing")
+                            .build(),
+                    )
+                }
+
+                builder.build()
+            }
+        }
+    }
+
+    override fun farewell(request: FarewellRequest, responseObserver: StreamObserver<FarewellResponse>) {
+        responseObserver.respondWith {
+            val requestId = UUID.randomUUID().toString()
+            val userId = AuthInterceptor.USER_ID_CTX_KEY.get() ?: "unknown"
+            val tenantId = AuthInterceptor.TENANT_ID_CTX_KEY.get() ?: "unknown"
+
+            withFields("requestId" to requestId, "rpc.method" to "Farewell") {
+                logger.info { "Received farewell request for name=${request.name}, userId=$userId, tenantId=$tenantId" }
+
+                delay(10)
+
+                withContext(Dispatchers.IO) {
+                    logger.info { "Processing farewell on IO dispatcher - userId=$userId, tenantId=$tenantId" }
+                    delay(10)
+                }
+
+                logger.info { "Sending farewell response for requestId=$requestId" }
+
+                val builder = FarewellResponse.newBuilder()
+                    .setMessage("Goodbye, ${request.name}! See you next time.")
+                    .setRequestId(requestId)
+
+                // Simulate a 404 for unknown users
+                if (request.name.equals("unknown", ignoreCase = true)) {
+                    builder.setError(
+                        Error.newBuilder()
+                            .setHttpCode(404)
+                            .setReason("User not found")
+                            .build(),
+                    )
+                }
+
+                builder.build()
             }
         }
     }

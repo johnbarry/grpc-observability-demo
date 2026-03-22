@@ -1,5 +1,6 @@
 package com.example.grpcobservability
 
+import com.example.grpcobservability.proto.FarewellRequest
 import com.example.grpcobservability.proto.GreetRequest
 import com.example.grpcobservability.proto.GreetResponse
 import com.example.grpcobservability.proto.GreetingServiceGrpc
@@ -17,6 +18,7 @@ import org.apache.logging.log4j.core.layout.PatternLayout
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
@@ -227,5 +229,222 @@ class GreetingServiceIntegrationTest {
             rootLogger.removeAppender(appender)
             appender.stop()
         }
+    }
+
+    // ── Farewell method tests ───────────────────────────────────────────
+
+    @Test
+    fun testFarewellReturnsSuccessResponse() {
+        val stub = buildStubWithMetadata("user-42", "tenant-abc", "00-3af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+
+        val request = FarewellRequest.newBuilder()
+            .setName("Alice")
+            .setUserId("user-42")
+            .setTenantId("tenant-abc")
+            .build()
+
+        val response = stub.farewell(request)
+
+        assertEquals("Goodbye, Alice! See you next time.", response.message)
+        assertTrue(response.requestId.isNotBlank())
+        assertFalse(response.hasError(), "Successful farewell should not have an error")
+    }
+
+    @Test
+    fun testFarewellReturnsErrorForUnknownUser() {
+        val stub = buildStubWithMetadata("user-42", "tenant-abc", "00-4af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+
+        val request = FarewellRequest.newBuilder()
+            .setName("unknown")
+            .setUserId("user-42")
+            .setTenantId("tenant-abc")
+            .build()
+
+        val response = stub.farewell(request)
+
+        assertTrue(response.hasError(), "Farewell for 'unknown' should have an error")
+        assertEquals(404, response.error.httpCode)
+        assertEquals("User not found", response.error.reason)
+    }
+
+    @Test
+    fun testGreetReturnsErrorForErrorName() {
+        val stub = buildStubWithMetadata("user-42", "tenant-abc", "00-5af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+
+        val request = GreetRequest.newBuilder()
+            .setName("error")
+            .setUserId("user-42")
+            .setTenantId("tenant-abc")
+            .build()
+
+        val response = stub.greet(request)
+
+        assertTrue(response.hasError(), "Greet for 'error' should have an error")
+        assertEquals(500, response.error.httpCode)
+        assertEquals("Simulated internal error for testing", response.error.reason)
+    }
+
+    // ── Logging interceptor tests ───────────────────────────────────────
+
+    @Test
+    fun testLoggingInterceptorLogsStartAndEndForSuccessfulCall() {
+        val capturedEvents = ConcurrentLinkedQueue<LogEvent>()
+        val appender = createTestAppender(capturedEvents)
+        val rootLogger = LogManager.getRootLogger() as Logger
+        rootLogger.addAppender(appender)
+
+        try {
+            val stub = buildStubWithMetadata("user-42", "tenant-abc", "00-6af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+            stub.greet(
+                GreetRequest.newBuilder()
+                    .setName("LogTest")
+                    .setUserId("user-42")
+                    .setTenantId("tenant-abc")
+                    .build(),
+            )
+
+            Thread.sleep(500)
+
+            val startLog = capturedEvents.find {
+                it.message.formattedMessage.contains("gRPC START") &&
+                    it.message.formattedMessage.contains("GreetingService/Greet")
+            }
+            assertTrue(startLog != null, "Expected 'gRPC START' log for Greet")
+
+            val endLog = capturedEvents.find {
+                it.message.formattedMessage.contains("gRPC END") &&
+                    it.message.formattedMessage.contains("GreetingService/Greet") &&
+                    it.message.formattedMessage.contains("OK")
+            }
+            assertTrue(endLog != null, "Expected 'gRPC END ... OK' log for successful Greet")
+        } finally {
+            rootLogger.removeAppender(appender)
+            appender.stop()
+        }
+    }
+
+    @Test
+    fun testLoggingInterceptorLogsFailureForErrorResponse() {
+        val capturedEvents = ConcurrentLinkedQueue<LogEvent>()
+        val appender = createTestAppender(capturedEvents)
+        val rootLogger = LogManager.getRootLogger() as Logger
+        rootLogger.addAppender(appender)
+
+        try {
+            val stub = buildStubWithMetadata("user-42", "tenant-abc", "00-7af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+            stub.greet(
+                GreetRequest.newBuilder()
+                    .setName("error")
+                    .setUserId("user-42")
+                    .setTenantId("tenant-abc")
+                    .build(),
+            )
+
+            Thread.sleep(500)
+
+            val endLog = capturedEvents.find {
+                it.message.formattedMessage.contains("gRPC END") &&
+                    it.message.formattedMessage.contains("GreetingService/Greet") &&
+                    it.message.formattedMessage.contains("httpCode=500")
+            }
+            assertTrue(endLog != null, "Expected 'gRPC END' log with httpCode=500 for error response")
+            assertEquals(
+                org.apache.logging.log4j.Level.WARN,
+                endLog!!.level,
+                "Error response should be logged at WARN level",
+            )
+        } finally {
+            rootLogger.removeAppender(appender)
+            appender.stop()
+        }
+    }
+
+    @Test
+    fun testLoggingInterceptorLogsFarewellStartAndEnd() {
+        val capturedEvents = ConcurrentLinkedQueue<LogEvent>()
+        val appender = createTestAppender(capturedEvents)
+        val rootLogger = LogManager.getRootLogger() as Logger
+        rootLogger.addAppender(appender)
+
+        try {
+            val stub = buildStubWithMetadata("user-42", "tenant-abc", "00-8af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+            stub.farewell(
+                FarewellRequest.newBuilder()
+                    .setName("LogFarewell")
+                    .setUserId("user-42")
+                    .setTenantId("tenant-abc")
+                    .build(),
+            )
+
+            Thread.sleep(500)
+
+            val startLog = capturedEvents.find {
+                it.message.formattedMessage.contains("gRPC START") &&
+                    it.message.formattedMessage.contains("GreetingService/Farewell")
+            }
+            assertTrue(startLog != null, "Expected 'gRPC START' log for Farewell")
+
+            val endLog = capturedEvents.find {
+                it.message.formattedMessage.contains("gRPC END") &&
+                    it.message.formattedMessage.contains("GreetingService/Farewell") &&
+                    it.message.formattedMessage.contains("OK")
+            }
+            assertTrue(endLog != null, "Expected 'gRPC END ... OK' log for successful Farewell")
+        } finally {
+            rootLogger.removeAppender(appender)
+            appender.stop()
+        }
+    }
+
+    @Test
+    fun testLoggingInterceptorLogsFarewellFailure() {
+        val capturedEvents = ConcurrentLinkedQueue<LogEvent>()
+        val appender = createTestAppender(capturedEvents)
+        val rootLogger = LogManager.getRootLogger() as Logger
+        rootLogger.addAppender(appender)
+
+        try {
+            val stub = buildStubWithMetadata("user-42", "tenant-abc", "00-9af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+            stub.farewell(
+                FarewellRequest.newBuilder()
+                    .setName("unknown")
+                    .setUserId("user-42")
+                    .setTenantId("tenant-abc")
+                    .build(),
+            )
+
+            Thread.sleep(500)
+
+            val endLog = capturedEvents.find {
+                it.message.formattedMessage.contains("gRPC END") &&
+                    it.message.formattedMessage.contains("GreetingService/Farewell") &&
+                    it.message.formattedMessage.contains("httpCode=404")
+            }
+            assertTrue(endLog != null, "Expected 'gRPC END' log with httpCode=404 for unknown user")
+            assertEquals(
+                org.apache.logging.log4j.Level.WARN,
+                endLog!!.level,
+                "404 response should be logged at WARN level",
+            )
+        } finally {
+            rootLogger.removeAppender(appender)
+            appender.stop()
+        }
+    }
+
+    private fun createTestAppender(capturedEvents: ConcurrentLinkedQueue<LogEvent>): AbstractAppender {
+        val appender = object : AbstractAppender(
+            "TestCapture-${System.nanoTime()}",
+            null,
+            PatternLayout.createDefaultLayout(),
+            true,
+            emptyArray(),
+        ) {
+            override fun append(event: LogEvent) {
+                capturedEvents.add(event.toImmutable())
+            }
+        }
+        appender.start()
+        return appender
     }
 }
