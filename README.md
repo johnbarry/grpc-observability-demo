@@ -216,8 +216,8 @@ src/main/kotlin/com/example/grpcobservability/
   context/
     ObservabilityContext.kt   -- The single ThreadContextElement that propagates
                                  gRPC Context, OTel Context, and derives MDC.
-                                 Uses Span.fromContext() to read from the captured
-                                 OTel context directly (not thread-local Span.current()).
+                                 Uses Span.current() after otelContext.makeCurrent()
+                                 to read trace/span IDs for MDC derivation.
                                  Also contains MdcProviders registry, withFields(),
                                  and captureObservabilityContext().
     GrpcCoroutineScope.kt     -- respondWith() and streamWith() extension functions
