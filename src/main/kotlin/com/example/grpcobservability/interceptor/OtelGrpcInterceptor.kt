@@ -7,7 +7,6 @@ import io.grpc.Metadata
 import io.grpc.ServerCall
 import io.grpc.ServerCallHandler
 import io.grpc.ServerInterceptor
-import io.opentelemetry.api.trace.Span
 import io.opentelemetry.api.trace.SpanKind
 import io.opentelemetry.api.trace.StatusCode
 import io.opentelemetry.api.trace.Tracer
@@ -30,7 +29,19 @@ object GrpcHeadersGetter : TextMapGetter<Metadata> {
  * Extracts the W3C traceparent from gRPC metadata, starts a server span,
  * and manages the OTel context scope.
  *
- * Does NOT touch MDC — that is derived by [ObservabilityContext] in the coroutine layer.
+ * The scope is held open for the call duration so that the OTel context is available
+ * on the interceptor thread when the service method runs (via onHalfClose). Note that
+ * next.startCall() only sets up the listener chain — the service method runs later,
+ * so we cannot close the scope after startCall returns.
+ *
+ * The scope.close() call in endSpan may execute on a different thread than makeCurrent()
+ * (e.g. a coroutine thread calling onCompleted → close). This is technically incorrect
+ * per OTel's API contract, but harmless in practice — it restores the calling thread's
+ * previous OTel context, which is typically root on a thread-pool thread. The captured
+ * OTel context is propagated correctly within coroutines by ObservabilityContext, which
+ * manages its own makeCurrent/close cycle on each thread switch.
+ *
+ * Does NOT touch MDC — that is derived by ObservabilityContext in the coroutine layer.
  */
 class OtelGrpcInterceptor(
     private val tracer: Tracer,
@@ -49,16 +60,16 @@ class OtelGrpcInterceptor(
             .setSpanKind(SpanKind.SERVER)
             .startSpan()
 
-        val scopedContext = extractedContext.with(span)
-        val scope = scopedContext.makeCurrent()
+        val spanContext = extractedContext.with(span)
+        val scope = spanContext.makeCurrent()
 
         logger.debug { "Started span for ${call.methodDescriptor.fullMethodName}" }
 
         // Guard against double-close: both close() and onCancel() can fire in edge cases
-        val closed = AtomicBoolean(false)
+        val ended = AtomicBoolean(false)
 
         fun endSpan(status: StatusCode, description: String) {
-            if (closed.compareAndSet(false, true)) {
+            if (ended.compareAndSet(false, true)) {
                 if (status == StatusCode.ERROR) {
                     span.setStatus(status, description)
                 }

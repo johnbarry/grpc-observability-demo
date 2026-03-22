@@ -16,6 +16,13 @@ import io.opentelemetry.context.Context as OtelContext
  * Interceptors register their context keys here rather than writing to MDC directly.
  * This decouples the interceptor layer from the logging layer — adding a new
  * interceptor that stores data in gRPC Context only requires registering a provider.
+ *
+ * Thread safety: register() is called during class init (AuthInterceptor companion
+ * init block), which runs during Spring bean creation — before any request threads
+ * start. deriveFrom() is called on request threads but only reads the list.
+ * This is safe because Spring's single-threaded bean initialization provides a
+ * happens-before guarantee. If you need to register providers after startup,
+ * switch to CopyOnWriteArrayList.
  */
 object MdcProviders {
     private val providers = mutableListOf<(GrpcContext) -> Map<String, String>>()
@@ -95,9 +102,11 @@ class ObservabilityContext private constructor(
         // From gRPC context via registered providers
         putAll(MdcProviders.deriveFrom(grpcContext))
 
-        // From OTel span — read from the captured context directly rather than
-        // Span.current() to avoid depending on thread-local state or method ordering
-        val spanCtx = Span.fromContext(otelContext).spanContext
+        // From OTel span — uses Span.current() which reads from the thread-local
+        // installed by otelContext.makeCurrent() on line 72 above. This ordering is
+        // safe because buildMdcEntries() is only called from updateThreadContext()
+        // after makeCurrent() has executed.
+        val spanCtx = Span.current().spanContext
         if (spanCtx.isValid) {
             put("trace.id", spanCtx.traceId)
             put("span.id", spanCtx.spanId)

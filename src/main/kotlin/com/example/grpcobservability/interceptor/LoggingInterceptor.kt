@@ -9,6 +9,8 @@ import io.grpc.ServerCall
 import io.grpc.ServerCallHandler
 import io.grpc.ServerInterceptor
 import io.grpc.Status
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 private val logger = KotlinLogging.logger {}
 
@@ -29,19 +31,22 @@ class LoggingInterceptor : ServerInterceptor {
     ): ServerCall.Listener<ReqT> {
         val methodName = call.methodDescriptor.fullMethodName
         val startNanos = System.nanoTime()
-        var messageIndex = 0
-        var lastError: ErrorInfo? = null
+
+        // Visible across threads: sendMessage() runs on the coroutine thread (which may
+        // vary across suspension points), while close() runs on the gRPC transport thread.
+        val messageIndex = AtomicInteger(0)
+        val lastError = AtomicReference<ErrorInfo?>(null)
 
         logger.info { "gRPC START $methodName" }
 
         val wrappedCall = object : SimpleForwardingServerCall<ReqT, RespT>(call) {
 
             override fun sendMessage(message: RespT) {
-                messageIndex++
+                val idx = messageIndex.incrementAndGet()
                 val errorResult = inspectForError(message)
                 if (errorResult != null) {
-                    lastError = errorResult
-                    val suffix = if (call.methodDescriptor.type.serverSendsOneMessage()) "" else " [message #$messageIndex]"
+                    lastError.set(errorResult)
+                    val suffix = if (call.methodDescriptor.type.serverSendsOneMessage()) "" else " [message #$idx]"
                     logger.warn {
                         "gRPC MSG   $methodName$suffix — response contains error: " +
                             "httpCode=${errorResult.httpCode} reason=\"${errorResult.reason}\""
@@ -52,6 +57,7 @@ class LoggingInterceptor : ServerInterceptor {
 
             override fun close(status: Status, trailers: Metadata) {
                 val durationMs = (System.nanoTime() - startNanos) / 1_000_000
+                val error = lastError.get()
 
                 when {
                     !status.isOk -> {
@@ -60,10 +66,10 @@ class LoggingInterceptor : ServerInterceptor {
                                 "description=\"${status.description ?: ""}\" (${durationMs}ms)"
                         }
                     }
-                    lastError != null -> {
+                    error != null -> {
                         logger.warn {
                             "gRPC END   $methodName — FAILED " +
-                                "httpCode=${lastError!!.httpCode} reason=\"${lastError!!.reason}\" (${durationMs}ms)"
+                                "httpCode=${error.httpCode} reason=\"${error.reason}\" (${durationMs}ms)"
                         }
                     }
                     else -> {
