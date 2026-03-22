@@ -4,6 +4,9 @@ import com.example.grpcobservability.proto.GreetingServiceGrpc
 import io.grpc.ManagedChannel
 import io.grpc.Metadata
 import io.grpc.stub.MetadataUtils
+import io.opentelemetry.api.OpenTelemetry
+import io.opentelemetry.api.trace.Span
+import io.opentelemetry.api.trace.SpanKind
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.core.LogEvent
 import org.apache.logging.log4j.core.Logger
@@ -38,7 +41,28 @@ object GrpcTestSupport {
             .withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata))
     }
 
-    fun traceparent(traceId: String): String = "00-$traceId-b7ad6b7169203331-01"
+    /**
+     * Creates a real parent span and returns its W3C traceparent header value.
+     * The parent span remains open — call [Span.end] after the gRPC call completes
+     * so that both parent and child appear in the exporter.
+     */
+    fun createParentSpan(openTelemetry: OpenTelemetry, operationName: String): ParentSpan {
+        val tracer = openTelemetry.getTracer("test-client")
+        val span = tracer.spanBuilder(operationName)
+            .setSpanKind(SpanKind.CLIENT)
+            .startSpan()
+        val traceId = span.spanContext.traceId
+        val spanId = span.spanContext.spanId
+        val traceparent = "00-$traceId-$spanId-01"
+        return ParentSpan(span, traceId, spanId, traceparent)
+    }
+
+    data class ParentSpan(
+        val span: Span,
+        val traceId: String,
+        val spanId: String,
+        val traceparent: String,
+    )
 
     private fun buildMetadata(userId: String, tenantId: String, traceparent: String?): Metadata =
         Metadata().apply {

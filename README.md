@@ -330,17 +330,21 @@ The `grpc-kotlin` project can generate coroutine-based service stubs where each 
 
 ## What Each Test Proves
 
-### `GreetingServiceIntegrationTest` (10 tests, full Spring Boot context)
+### `GreetingServiceIntegrationTest` (11 tests, full Spring Boot context)
 
-These tests start the actual gRPC server and make real gRPC calls to it.
+These tests start the actual gRPC server and make real gRPC calls to it. Every test creates a real parent span using the test's `OpenTelemetry` instance and passes it via the `traceparent` header, so all span assertions verify actual parent-child relationships — not fabricated trace IDs.
 
-#### Context propagation (3 tests)
+#### Parent-child span verification (3 tests)
 
-**`testGreetPopulatesFullContext`** — Sends a unary gRPC call with a known `traceparent` header (containing trace ID `0af765...`), `x-user-id`, and `x-tenant-id`. Asserts that the response is correct, and that an OTel span was exported with a trace ID matching the one we sent. This proves end-to-end trace propagation: client header -> interceptor -> OTel span -> exporter.
+**`testGreetCreatesChildSpanOfParent`** — Creates a real `CLIENT` parent span, sends a unary gRPC call with its traceparent. Asserts that the exported server span shares the parent's `traceId`, has `parentSpanId` equal to the parent's `spanId`, and has its own unique `spanId`. This proves the `OtelGrpcInterceptor` correctly extracts the W3C traceparent and creates a child span.
 
-**`testGreetStreamPropagatesContext`** — Sends a server-streaming call and collects all 5 responses. Asserts that all responses arrive and that a span with the correct trace ID is exported. This proves context propagation works for streaming RPCs (not just unary).
+**`testFarewellCreatesChildSpanOfParent`** — Same verification for the `Farewell` RPC. Proves both unary methods create proper child spans.
 
-**`testContextPropagationAcrossDispatcherSwitch`** — The most important test. Installs a custom Log4j2 appender that captures `LogEvent` objects into a queue. Makes a gRPC call, then inspects the captured log events for the ones emitted from `Dispatchers.IO` — both **before** and **after** a `delay()`. Asserts that `userId`, `tenantId`, and `trace.id` are present in the MDC of those log events. This proves that all three context systems survive a dispatcher switch AND a suspension/resumption on a potentially different thread within the IO pool.
+**`testGreetStreamCreatesChildSpanOfParent`** — Same verification for the server-streaming `GreetStream` RPC. Proves child span creation works for streaming calls.
+
+#### Context propagation across dispatcher switch (1 test)
+
+**`testContextPropagationAcrossDispatcherSwitch`** — The most important test. Creates a parent span, makes a gRPC call, then inspects captured log events from `Dispatchers.IO` — both **before** and **after** a `delay()`. Asserts that `userId`, `tenantId`, and the exact parent `trace.id` are present in MDC. This proves that all three context systems survive a dispatcher switch AND a suspension/resumption on a potentially different thread within the IO pool.
 
 #### Farewell method and Error field (3 tests)
 

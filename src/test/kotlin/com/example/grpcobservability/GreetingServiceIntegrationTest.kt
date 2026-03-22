@@ -7,11 +7,14 @@ import com.example.grpcobservability.service.ErrorTriggers
 import io.grpc.ManagedChannel
 import io.grpc.ManagedChannelBuilder
 import io.grpc.stub.StreamObserver
+import io.opentelemetry.api.OpenTelemetry
+import io.opentelemetry.api.trace.SpanKind
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
@@ -27,6 +30,9 @@ class GreetingServiceIntegrationTest {
 
     @Autowired
     lateinit var spanExporter: InMemorySpanExporter
+
+    @Autowired
+    lateinit var openTelemetry: OpenTelemetry
 
     companion object {
         private lateinit var channel: ManagedChannel
@@ -51,43 +57,78 @@ class GreetingServiceIntegrationTest {
         spanExporter.reset()
     }
 
-    // ── Context propagation ─────────────────────────────────────────────
+    // ── Parent-child span verification ──────────────────────────────────
 
     @Test
-    fun testGreetPopulatesFullContext() {
-        val knownTraceId = "0af7651916cd43dd8448eb211c80319c"
-        val stub = GrpcTestSupport.blockingStub(
-            channel, "user-42", "tenant-abc", GrpcTestSupport.traceparent(knownTraceId),
-        )
+    fun testGreetCreatesChildSpanOfParent() {
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-greet-client")
+        val stub = GrpcTestSupport.blockingStub(channel, traceparent = parent.traceparent)
 
         val response = stub.greet(
-            GreetRequest.newBuilder().setName("Alice").setUserId("user-42").setTenantId("tenant-abc").build(),
+            GreetRequest.newBuilder().setName("Alice").setUserId("test-user").setTenantId("test-tenant").build(),
         )
 
         assertEquals("Hello, Alice!", response.message)
-        assertTrue(response.requestId.isNotBlank())
-
-        Thread.sleep(200)
+        parent.span.end()
+        Thread.sleep(300)
 
         val spans = spanExporter.finishedSpanItems
-        assertTrue(spans.isNotEmpty(), "Expected at least one span to be exported")
-        val greetSpan = spans.find { it.name.contains("Greet") }
-        assertTrue(greetSpan != null, "Expected a span named containing 'Greet'")
-        assertEquals(knownTraceId, greetSpan!!.traceId, "Span trace ID should match injected traceparent")
+        assertTrue(spans.size >= 2, "Expected at least parent + child span, got ${spans.size}")
+
+        val parentExported = spans.find { it.spanId == parent.spanId }
+        assertTrue(parentExported != null, "Parent span should be exported")
+        assertEquals(parent.traceId, parentExported!!.traceId)
+
+        val serverSpan = spans.find {
+            it.name.contains("GreetingService/Greet") && it.kind == SpanKind.SERVER
+        }
+        assertTrue(serverSpan != null, "Expected a SERVER span for GreetingService/Greet")
+        assertEquals(parent.traceId, serverSpan!!.traceId, "Child span must share parent's traceId")
+        assertEquals(parent.spanId, serverSpan.parentSpanId, "Child span's parentSpanId must be the parent's spanId")
+        assertNotEquals(parent.spanId, serverSpan.spanId, "Child span must have its own spanId")
+
+        println("=== Parent-Child Span Relationship (Greet) ===")
+        println("  Parent: traceId=${parent.traceId} spanId=${parent.spanId} name=${parentExported.name}")
+        println("  Child:  traceId=${serverSpan.traceId} spanId=${serverSpan.spanId} parentSpanId=${serverSpan.parentSpanId} name=${serverSpan.name}")
     }
 
     @Test
-    fun testGreetStreamPropagatesContext() {
-        val knownTraceId = "1af7651916cd43dd8448eb211c80319c"
-        val stub = GrpcTestSupport.asyncStub(
-            channel, "user-stream", "tenant-stream", GrpcTestSupport.traceparent(knownTraceId),
+    fun testFarewellCreatesChildSpanOfParent() {
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-farewell-client")
+        val stub = GrpcTestSupport.blockingStub(channel, traceparent = parent.traceparent)
+
+        val response = stub.farewell(
+            FarewellRequest.newBuilder().setName("Alice").setUserId("test-user").setTenantId("test-tenant").build(),
         )
+
+        assertEquals("Goodbye, Alice! See you next time.", response.message)
+        parent.span.end()
+        Thread.sleep(300)
+
+        val spans = spanExporter.finishedSpanItems
+        val serverSpan = spans.find {
+            it.name.contains("GreetingService/Farewell") && it.kind == SpanKind.SERVER
+        }
+        assertTrue(serverSpan != null, "Expected a SERVER span for GreetingService/Farewell")
+        assertEquals(parent.traceId, serverSpan!!.traceId, "Child span must share parent's traceId")
+        assertEquals(parent.spanId, serverSpan.parentSpanId, "Child span's parentSpanId must be the parent's spanId")
+        assertNotEquals(parent.spanId, serverSpan.spanId, "Child span must have its own spanId")
+
+        println("=== Parent-Child Span Relationship (Farewell) ===")
+        println("  Parent: traceId=${parent.traceId} spanId=${parent.spanId}")
+        println("  Child:  traceId=${serverSpan.traceId} spanId=${serverSpan.spanId} parentSpanId=${serverSpan.parentSpanId} name=${serverSpan.name}")
+    }
+
+    @Test
+    fun testGreetStreamCreatesChildSpanOfParent() {
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-stream-client")
+        val stub = GrpcTestSupport.asyncStub(channel, traceparent = parent.traceparent)
 
         val responses = mutableListOf<GreetResponse>()
         val latch = CountDownLatch(1)
 
         stub.greetStream(
-            GreetRequest.newBuilder().setName("Bob").setUserId("user-stream").setTenantId("tenant-stream").build(),
+            GreetRequest.newBuilder().setName("Bob").setUserId("test-user").setTenantId("test-tenant").build(),
             object : StreamObserver<GreetResponse> {
                 override fun onNext(value: GreetResponse) { responses.add(value) }
                 override fun onError(t: Throwable) { latch.countDown() }
@@ -97,26 +138,35 @@ class GreetingServiceIntegrationTest {
 
         assertTrue(latch.await(10, TimeUnit.SECONDS), "Stream should complete within 10s")
         assertEquals(5, responses.size, "Expected 5 streamed responses")
-
-        Thread.sleep(200)
+        parent.span.end()
+        Thread.sleep(300)
 
         val spans = spanExporter.finishedSpanItems
-        assertTrue(spans.isNotEmpty(), "Expected spans to be exported for streaming call")
-        val streamSpan = spans.find { it.name.contains("GreetStream") }
-        assertTrue(streamSpan != null, "Expected a span named containing 'GreetStream'")
-        assertEquals(knownTraceId, streamSpan!!.traceId, "Stream span trace ID should match injected traceparent")
+        val serverSpan = spans.find {
+            it.name.contains("GreetingService/GreetStream") && it.kind == SpanKind.SERVER
+        }
+        assertTrue(serverSpan != null, "Expected a SERVER span for GreetingService/GreetStream")
+        assertEquals(parent.traceId, serverSpan!!.traceId, "Stream child span must share parent's traceId")
+        assertEquals(parent.spanId, serverSpan.parentSpanId, "Stream child span's parentSpanId must be the parent's spanId")
+
+        println("=== Parent-Child Span Relationship (GreetStream) ===")
+        println("  Parent: traceId=${parent.traceId} spanId=${parent.spanId}")
+        println("  Child:  traceId=${serverSpan.traceId} spanId=${serverSpan.spanId} parentSpanId=${serverSpan.parentSpanId} name=${serverSpan.name}")
     }
+
+    // ── Context propagation across dispatcher switch ────────────────────
 
     @Test
     fun testContextPropagationAcrossDispatcherSwitch() = withCapturedLogs { capturedEvents ->
-        val knownTraceId = "2af7651916cd43dd8448eb211c80319c"
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-dispatcher-switch")
         val stub = GrpcTestSupport.blockingStub(
-            channel, "user-io-test", "tenant-io-test", GrpcTestSupport.traceparent(knownTraceId),
+            channel, "user-io-test", "tenant-io-test", parent.traceparent,
         )
 
         stub.greet(
             GreetRequest.newBuilder().setName("Charlie").setUserId("user-io-test").setTenantId("tenant-io-test").build(),
         )
+        parent.span.end()
 
         Thread.sleep(500)
 
@@ -127,7 +177,7 @@ class GreetingServiceIntegrationTest {
         val beforeMdc = beforeDelayLog!!.contextData.toMap()
         assertEquals("user-io-test", beforeMdc["userId"], "userId should propagate to IO dispatcher")
         assertEquals("tenant-io-test", beforeMdc["tenantId"], "tenantId should propagate to IO dispatcher")
-        assertTrue(beforeMdc["trace.id"]?.isNotBlank() == true, "trace.id should be present on IO dispatcher")
+        assertEquals(parent.traceId, beforeMdc["trace.id"], "trace.id should match parent span's traceId on IO dispatcher")
 
         val afterDelayLog = capturedEvents.find {
             it.message.formattedMessage.contains("Processing on IO dispatcher (after delay)")
@@ -136,70 +186,70 @@ class GreetingServiceIntegrationTest {
         val afterMdc = afterDelayLog!!.contextData.toMap()
         assertEquals("user-io-test", afterMdc["userId"], "userId should survive delay on IO dispatcher")
         assertEquals("tenant-io-test", afterMdc["tenantId"], "tenantId should survive delay on IO dispatcher")
-        assertTrue(afterMdc["trace.id"]?.isNotBlank() == true, "trace.id should survive delay on IO dispatcher")
+        assertEquals(parent.traceId, afterMdc["trace.id"], "trace.id should survive delay on IO dispatcher")
     }
 
     // ── Farewell method and Error field ─────────────────────────────────
 
     @Test
     fun testFarewellReturnsSuccessResponse() {
-        val stub = GrpcTestSupport.blockingStub(
-            channel, "user-42", "tenant-abc", GrpcTestSupport.traceparent("3af7651916cd43dd8448eb211c80319c"),
-        )
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-farewell-success")
+        val stub = GrpcTestSupport.blockingStub(channel, traceparent = parent.traceparent)
 
         val response = stub.farewell(
-            FarewellRequest.newBuilder().setName("Alice").setUserId("user-42").setTenantId("tenant-abc").build(),
+            FarewellRequest.newBuilder().setName("Alice").setUserId("test-user").setTenantId("test-tenant").build(),
         )
 
         assertEquals("Goodbye, Alice! See you next time.", response.message)
         assertTrue(response.requestId.isNotBlank())
         assertFalse(response.hasError(), "Successful farewell should not have an error")
+        parent.span.end()
     }
 
     @Test
     fun testFarewellReturnsErrorForUnknownUser() {
-        val stub = GrpcTestSupport.blockingStub(
-            channel, "user-42", "tenant-abc", GrpcTestSupport.traceparent("4af7651916cd43dd8448eb211c80319c"),
-        )
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-farewell-404")
+        val stub = GrpcTestSupport.blockingStub(channel, traceparent = parent.traceparent)
 
         val response = stub.farewell(
             FarewellRequest.newBuilder()
                 .setName(ErrorTriggers.FAREWELL_NOT_FOUND_NAME)
-                .setUserId("user-42").setTenantId("tenant-abc").build(),
+                .setUserId("test-user").setTenantId("test-tenant").build(),
         )
 
         assertTrue(response.hasError(), "Farewell for '${ErrorTriggers.FAREWELL_NOT_FOUND_NAME}' should have an error")
         assertEquals(404, response.error.httpCode)
         assertEquals("User not found", response.error.reason)
+        parent.span.end()
     }
 
     @Test
     fun testGreetReturnsErrorForErrorName() {
-        val stub = GrpcTestSupport.blockingStub(
-            channel, "user-42", "tenant-abc", GrpcTestSupport.traceparent("5af7651916cd43dd8448eb211c80319c"),
-        )
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-greet-500")
+        val stub = GrpcTestSupport.blockingStub(channel, traceparent = parent.traceparent)
 
         val response = stub.greet(
             GreetRequest.newBuilder()
                 .setName(ErrorTriggers.GREET_ERROR_NAME)
-                .setUserId("user-42").setTenantId("tenant-abc").build(),
+                .setUserId("test-user").setTenantId("test-tenant").build(),
         )
 
         assertTrue(response.hasError(), "Greet for '${ErrorTriggers.GREET_ERROR_NAME}' should have an error")
         assertEquals(500, response.error.httpCode)
         assertEquals("Simulated internal error for testing", response.error.reason)
+        parent.span.end()
     }
 
     // ── Logging interceptor ─────────────────────────────────────────────
 
     @Test
     fun testLoggingInterceptorLogsStartAndEndForSuccessfulCall() = withCapturedLogs { capturedEvents ->
-        val stub = GrpcTestSupport.blockingStub(
-            channel, "user-42", "tenant-abc", GrpcTestSupport.traceparent("6af7651916cd43dd8448eb211c80319c"),
-        )
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-log-success")
+        val stub = GrpcTestSupport.blockingStub(channel, traceparent = parent.traceparent)
         stub.greet(
-            GreetRequest.newBuilder().setName("LogTest").setUserId("user-42").setTenantId("tenant-abc").build(),
+            GreetRequest.newBuilder().setName("LogTest").setUserId("test-user").setTenantId("test-tenant").build(),
         )
+        parent.span.end()
 
         Thread.sleep(500)
 
@@ -215,12 +265,12 @@ class GreetingServiceIntegrationTest {
 
     @Test
     fun testLoggingInterceptorLogsFailureForErrorResponse() = withCapturedLogs { capturedEvents ->
-        val stub = GrpcTestSupport.blockingStub(
-            channel, "user-42", "tenant-abc", GrpcTestSupport.traceparent("7af7651916cd43dd8448eb211c80319c"),
-        )
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-log-error")
+        val stub = GrpcTestSupport.blockingStub(channel, traceparent = parent.traceparent)
         stub.greet(
-            GreetRequest.newBuilder().setName(ErrorTriggers.GREET_ERROR_NAME).setUserId("user-42").setTenantId("tenant-abc").build(),
+            GreetRequest.newBuilder().setName(ErrorTriggers.GREET_ERROR_NAME).setUserId("test-user").setTenantId("test-tenant").build(),
         )
+        parent.span.end()
 
         Thread.sleep(500)
 
@@ -235,12 +285,12 @@ class GreetingServiceIntegrationTest {
 
     @Test
     fun testLoggingInterceptorLogsFarewellStartAndEnd() = withCapturedLogs { capturedEvents ->
-        val stub = GrpcTestSupport.blockingStub(
-            channel, "user-42", "tenant-abc", GrpcTestSupport.traceparent("8af7651916cd43dd8448eb211c80319c"),
-        )
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-log-farewell")
+        val stub = GrpcTestSupport.blockingStub(channel, traceparent = parent.traceparent)
         stub.farewell(
-            FarewellRequest.newBuilder().setName("LogFarewell").setUserId("user-42").setTenantId("tenant-abc").build(),
+            FarewellRequest.newBuilder().setName("LogFarewell").setUserId("test-user").setTenantId("test-tenant").build(),
         )
+        parent.span.end()
 
         Thread.sleep(500)
 
@@ -256,12 +306,12 @@ class GreetingServiceIntegrationTest {
 
     @Test
     fun testLoggingInterceptorLogsFarewellFailure() = withCapturedLogs { capturedEvents ->
-        val stub = GrpcTestSupport.blockingStub(
-            channel, "user-42", "tenant-abc", GrpcTestSupport.traceparent("9af7651916cd43dd8448eb211c80319c"),
-        )
+        val parent = GrpcTestSupport.createParentSpan(openTelemetry, "test-log-farewell-404")
+        val stub = GrpcTestSupport.blockingStub(channel, traceparent = parent.traceparent)
         stub.farewell(
-            FarewellRequest.newBuilder().setName(ErrorTriggers.FAREWELL_NOT_FOUND_NAME).setUserId("user-42").setTenantId("tenant-abc").build(),
+            FarewellRequest.newBuilder().setName(ErrorTriggers.FAREWELL_NOT_FOUND_NAME).setUserId("test-user").setTenantId("test-tenant").build(),
         )
+        parent.span.end()
 
         Thread.sleep(500)
 
