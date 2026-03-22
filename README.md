@@ -158,8 +158,19 @@ src/main/kotlin/com/example/grpcobservability/
     GreetingServiceImpl.kt    -- The gRPC service. Uses respondWith/streamWith to handle
                                  requests in coroutines with full context propagation.
   config/
-    GrpcConfig.kt             -- Registers the two interceptors as Spring beans.
+    GrpcConfig.kt             -- Registers the two manual interceptors as Spring beans.
+                                 (ObservationGrpcServerInterceptor is auto-configured
+                                 separately by Spring gRPC + Actuator.)
 ```
+
+#### Dependencies for auto-instrumentation
+
+The auto-instrumentation is enabled by two dependencies working together:
+
+- **`spring-boot-starter-actuator`** — provides `MeterRegistry` and `ObservationRegistry`. Spring gRPC detects the `ObservationRegistry` bean and auto-registers `ObservationGrpcServerInterceptor`.
+- **`micrometer-tracing-bridge-otel`** — bridges Micrometer observations to OTel spans. Without this, you get metrics but not traces from the observation interceptor.
+
+The `spring.grpc.server.observation.enabled` property (default `true`) controls whether the observation interceptor is registered.
 
 ### The `withFields` helper
 
@@ -211,11 +222,14 @@ Spring Framework 7.0 (which ships with Spring Boot 4.0) introduces `PropagationC
 
 ### Spring gRPC's auto-configured observation interceptors
 
-When you add `spring-boot-starter-actuator` to a Spring gRPC project, Spring auto-configures `ObservationGrpcServerInterceptor` which handles tracing via Micrometer's Observation API. We didn't use this because:
+When you add `spring-boot-starter-actuator` to a Spring gRPC project, Spring auto-configures `ObservationGrpcServerInterceptor` (from Micrometer core, at `@Order(0)`) which instruments every gRPC call via the Micrometer Observation API. This project **includes both** the auto-configured observation interceptor and our manual `OtelGrpcInterceptor`:
 
-- The goal of this project is to show the **mechanics** of context propagation, not to hide them behind auto-configuration.
-- The auto-configured interceptor feeds into Micrometer, which bridges to OTel. Our manual `OtelGrpcInterceptor` talks to OTel directly, which is easier to understand and debug.
-- In production, you might well use the auto-configured interceptors. This demo is about understanding what they do under the hood.
+- **`ObservationGrpcServerInterceptor`** (auto-configured, `@Order(0)`) — produces Micrometer metrics (`grpc.server` timer, `grpc.server.active` long task timer, `grpc.server.received`/`sent` counters) with tags like `rpc.method`, `rpc.service`, `grpc.status_code`, and `rpc.type`. With `micrometer-tracing-bridge-otel` on the classpath, it also produces OTel spans via the bridge.
+- **`OtelGrpcInterceptor`** (manual, `@Order(1)`) — creates OTel spans directly and manages the OTel context scope for our coroutine context propagation machinery.
+
+The manual interceptor exists because the goal of this project is to show the **mechanics** of context propagation, not to hide them behind auto-configuration. In production, you might rely solely on the auto-configured interceptor and remove the manual one. `AutoInstrumentationTest` proves the auto-instrumentation works; the other tests prove the manual context propagation works.
+
+The observation interceptor closes its observation (and thus the span/timer) by wrapping both the `ServerCall` (stopping on `close()`) and the `ServerCall.Listener` (stopping on `onCancel()`). It doesn't just fire at the start — gRPC's interceptor API gives it hooks into the full call lifecycle.
 
 ### `grpc-kotlin-stub` (Kotlin coroutine stubs)
 
@@ -251,6 +265,20 @@ These tests verify the context propagation mechanisms in isolation, without star
 
 **`single element propagates gRPC context, OTel context, and MDC together`** — The capstone unit test. Sets up both gRPC and OTel context, creates a single `ObservabilityContext()`, and asserts that all three systems (gRPC keys, OTel trace ID in MDC, gRPC Context.Key.get()) work across `Dispatchers.IO` + `delay`.
 
+### `AutoInstrumentationTest` (5 tests, full Spring Boot context)
+
+These tests verify that Spring gRPC's built-in `ObservationGrpcServerInterceptor` auto-instruments gRPC calls — producing both Micrometer metrics and OTel traces without any manual interceptor code.
+
+**`ObservationRegistry is configured and not no-op`** — Asserts that `ObservationRegistry` is properly wired (not `NOOP`), confirming that `spring-boot-starter-actuator` is on the classpath and the observation infrastructure is active.
+
+**`unary gRPC call produces grpc server timer metric`** — Makes a unary gRPC call, then queries the `MeterRegistry` for a `grpc.server` timer. Asserts the timer exists, has recorded at least one call with non-zero duration, and carries the correct tags: `rpc.method=Greet`, `rpc.service=greeting.GreetingService`, `grpc.status_code=OK`.
+
+**`streaming gRPC call produces grpc server timer metric`** — Same as above for server-streaming. Asserts that `grpc.server` timer exists with `rpc.method=GreetStream` after collecting all 5 streamed responses.
+
+**`observation bridge produces OTel spans for gRPC calls`** — Makes a gRPC call and inspects the `InMemorySpanExporter` for spans. Proves that the Micrometer-to-OTel tracing bridge creates OTel spans from observations, without relying on our manual `OtelGrpcInterceptor`.
+
+**`list all grpc-related meters after multiple calls`** — Makes several gRPC calls and dumps every meter whose name starts with `grpc.`. Shows the full set of auto-registered meters: `grpc.server` (timer), `grpc.server.active` (long task timer), `grpc.server.received` (counter), `grpc.server.sent` (counter) — each with tags for method, service, status code, peer info, and RPC type.
+
 ---
 
 ## Glossary
@@ -267,3 +295,6 @@ These tests verify the context propagation mechanisms in isolation, without star
 | **suspend / resume** | When a coroutine calls `delay()` or another suspending function, it **suspends** — it pauses and frees its thread. Later it **resumes**, possibly on a different thread. This is when context can be lost. |
 | **Interceptor** | gRPC middleware. Runs before/after your service code. Used here to extract headers into context objects. Similar to servlet filters or Spring `HandlerInterceptor`. |
 | **MdcProviders** | Our registry where interceptors declare how their gRPC Context keys map to MDC fields. `ObservabilityContext` calls all registered providers on each thread switch. |
+| **Observation** | A Micrometer concept that represents a unit of work. An observation produces both metrics (timers, counters) and traces (spans) from a single instrumentation point. Spring gRPC's `ObservationGrpcServerInterceptor` creates one observation per gRPC call. |
+| **ObservationRegistry** | The central Micrometer registry that manages observations. Provided by `spring-boot-starter-actuator`. Observation handlers attached to it determine what gets produced (metrics, traces, or both). |
+| **MeterRegistry** | Micrometer's registry for metrics (timers, counters, gauges). The observation system automatically creates meters from observations. In tests, a `SimpleMeterRegistry` is used; in production, you'd use Prometheus, Datadog, etc. |
