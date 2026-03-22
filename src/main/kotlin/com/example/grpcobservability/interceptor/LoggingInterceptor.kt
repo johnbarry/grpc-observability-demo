@@ -15,9 +15,10 @@ private val logger = KotlinLogging.logger {}
 /**
  * Logs the start and end of every gRPC method call.
  *
- * On method end, inspects the response protobuf for an `error` field.
- * If the error is present and its `http_code` is outside the 2xx range,
- * the call is logged as a failure at WARN level with the error details.
+ * On each response message (unary or streaming), inspects the protobuf for an `error`
+ * field. If the error is present and its `http_code` is outside the 2xx range, the
+ * message is logged as a failure at WARN level. For streaming RPCs, every message
+ * is inspected individually.
  */
 class LoggingInterceptor : ServerInterceptor {
 
@@ -28,21 +29,29 @@ class LoggingInterceptor : ServerInterceptor {
     ): ServerCall.Listener<ReqT> {
         val methodName = call.methodDescriptor.fullMethodName
         val startNanos = System.nanoTime()
+        var messageIndex = 0
+        var lastError: ErrorInfo? = null
 
         logger.info { "gRPC START $methodName" }
 
         val wrappedCall = object : SimpleForwardingServerCall<ReqT, RespT>(call) {
 
-            private var responseMessage: RespT? = null
-
             override fun sendMessage(message: RespT) {
-                responseMessage = message
+                messageIndex++
+                val errorResult = inspectForError(message)
+                if (errorResult != null) {
+                    lastError = errorResult
+                    val suffix = if (call.methodDescriptor.type.serverSendsOneMessage()) "" else " [message #$messageIndex]"
+                    logger.warn {
+                        "gRPC MSG   $methodName$suffix — response contains error: " +
+                            "httpCode=${errorResult.httpCode} reason=\"${errorResult.reason}\""
+                    }
+                }
                 super.sendMessage(message)
             }
 
             override fun close(status: Status, trailers: Metadata) {
                 val durationMs = (System.nanoTime() - startNanos) / 1_000_000
-                val errorResult = responseMessage?.let { inspectForError(it) }
 
                 when {
                     !status.isOk -> {
@@ -51,10 +60,10 @@ class LoggingInterceptor : ServerInterceptor {
                                 "description=\"${status.description ?: ""}\" (${durationMs}ms)"
                         }
                     }
-                    errorResult != null -> {
+                    lastError != null -> {
                         logger.warn {
-                            "gRPC END   $methodName — response contains error: " +
-                                "httpCode=${errorResult.httpCode} reason=\"${errorResult.reason}\" (${durationMs}ms)"
+                            "gRPC END   $methodName — FAILED " +
+                                "httpCode=${lastError!!.httpCode} reason=\"${lastError!!.reason}\" (${durationMs}ms)"
                         }
                     }
                     else -> {
@@ -88,7 +97,6 @@ class LoggingInterceptor : ServerInterceptor {
         val descriptor = message.descriptorForType
         val errorField = descriptor.findFieldByName("error") ?: return null
 
-        // optional field — check if it's been set
         if (!message.hasField(errorField)) return null
 
         val errorMsg = message.getField(errorField) as? Message ?: return null
@@ -98,7 +106,6 @@ class LoggingInterceptor : ServerInterceptor {
         val httpCode = errorMsg.getField(httpCodeField) as? Int ?: return null
         val reason = reasonField?.let { errorMsg.getField(it) as? String } ?: ""
 
-        // Only flag as failure if http_code is outside 2xx range
         if (httpCode in 200..299) return null
 
         return ErrorInfo(httpCode, reason)

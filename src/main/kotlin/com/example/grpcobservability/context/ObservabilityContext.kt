@@ -95,8 +95,9 @@ class ObservabilityContext private constructor(
         // From gRPC context via registered providers
         putAll(MdcProviders.deriveFrom(grpcContext))
 
-        // From OTel span
-        val spanCtx = Span.current().spanContext
+        // From OTel span — read from the captured context directly rather than
+        // Span.current() to avoid depending on thread-local state or method ordering
+        val spanCtx = Span.fromContext(otelContext).spanContext
         if (spanCtx.isValid) {
             put("trace.id", spanCtx.traceId)
             put("span.id", spanCtx.spanId)

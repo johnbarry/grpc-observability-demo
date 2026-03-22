@@ -113,9 +113,10 @@ Client sends gRPC request with headers:
 
   LoggingInterceptor (@Order(3), manual)
     - Logs "gRPC START {method}" at INFO
-    - Wraps ServerCall.sendMessage() to capture the response protobuf
-    - On close: inspects response for an Error field with non-2xx http_code
-    - Logs "gRPC END {method} — OK" at INFO, or failure details at WARN
+    - Wraps ServerCall.sendMessage() to inspect every response message
+      (unary or streaming) for an Error field with non-2xx http_code
+    - Logs "gRPC MSG" at WARN per-message if error detected
+    - Logs "gRPC END {method} — OK" at INFO, or "FAILED" at WARN
 
         |
         v
@@ -152,11 +153,14 @@ INFO  LoggingInterceptor - gRPC START greeting.GreetingService/Greet
 INFO  LoggingInterceptor - gRPC END   greeting.GreetingService/Greet — OK (35ms)
 ```
 
-For a call whose response contains an `Error` with non-2xx `http_code`:
+For a call whose response contains an `Error` with non-2xx `http_code`, the interceptor logs the error when the message is sent (`gRPC MSG`) and again in the end summary (`gRPC END`):
 ```
 INFO  LoggingInterceptor - gRPC START greeting.GreetingService/Farewell
-WARN  LoggingInterceptor - gRPC END   greeting.GreetingService/Farewell — response contains error: httpCode=404 reason="User not found" (31ms)
+WARN  LoggingInterceptor - gRPC MSG   greeting.GreetingService/Farewell — response contains error: httpCode=404 reason="User not found"
+WARN  LoggingInterceptor - gRPC END   greeting.GreetingService/Farewell — FAILED httpCode=404 reason="User not found" (31ms)
 ```
+
+For streaming RPCs, every message is inspected individually. If any message carries an error, the per-message `gRPC MSG` log fires immediately, and the `gRPC END` summary reports the last error seen.
 
 Note that both calls succeeded at the gRPC transport level — the `LoggingInterceptor` looks inside the response protobuf to detect domain-level failures. This is important because many monitoring systems only look at gRPC status codes, which would miss these business errors entirely.
 
@@ -212,6 +216,8 @@ src/main/kotlin/com/example/grpcobservability/
   context/
     ObservabilityContext.kt   -- The single ThreadContextElement that propagates
                                  gRPC Context, OTel Context, and derives MDC.
+                                 Uses Span.fromContext() to read from the captured
+                                 OTel context directly (not thread-local Span.current()).
                                  Also contains MdcProviders registry, withFields(),
                                  and captureObservabilityContext().
     GrpcCoroutineScope.kt     -- respondWith() and streamWith() extension functions
@@ -219,20 +225,25 @@ src/main/kotlin/com/example/grpcobservability/
                                  coroutines with error handling.
   interceptor/
     OtelGrpcInterceptor.kt    -- Extracts W3C traceparent from gRPC headers, starts
-                                 an OTel server span. Does not touch MDC.
+                                 an OTel server span. Uses AtomicBoolean guard to
+                                 prevent double-close if both close() and onCancel()
+                                 fire. Does not touch MDC.
     AuthInterceptor.kt        -- Extracts x-user-id and x-tenant-id from gRPC headers,
                                  stores in gRPC Context. Registers an MdcProvider so
                                  ObservabilityContext knows how to derive MDC from these.
-    LoggingInterceptor.kt     -- Logs start/end of every gRPC call. Inspects response
-                                 protobufs for an Error field with non-2xx http_code
-                                 and logs failures at WARN. Uses protobuf descriptors
+    LoggingInterceptor.kt     -- Logs start/end of every gRPC call. Inspects every
+                                 response message (unary and streaming) for an Error
+                                 field with non-2xx http_code. Logs per-message at WARN
+                                 and summarizes in the END log. Uses protobuf descriptors
                                  so it works generically across any response type.
   service/
     GreetingServiceImpl.kt    -- The gRPC service (Greet, Farewell, GreetStream).
-                                 Uses respondWith/streamWith to handle requests in
-                                 coroutines with full context propagation. Sets the
-                                 Error field for specific test inputs (name="error"
-                                 triggers 500, name="unknown" triggers 404).
+                                 Unary methods delegate to a shared handleUnary() that
+                                 manages context extraction, IO dispatcher switching,
+                                 and error resolution.
+    ErrorTriggers.kt          -- Constants for well-known request names that trigger
+                                 simulated error responses (shared between service and
+                                 tests to avoid magic strings).
   config/
     GrpcConfig.kt             -- Registers the three manual interceptors as Spring beans
                                  at @Order(1), @Order(2), @Order(3). The auto-configured

@@ -14,6 +14,7 @@ import io.opentelemetry.api.trace.Tracer
 import io.opentelemetry.context.Context
 import io.opentelemetry.context.propagation.TextMapGetter
 import io.opentelemetry.context.propagation.TextMapPropagator
+import java.util.concurrent.atomic.AtomicBoolean
 
 private val logger = KotlinLogging.logger {}
 
@@ -53,13 +54,23 @@ class OtelGrpcInterceptor(
 
         logger.debug { "Started span for ${call.methodDescriptor.fullMethodName}" }
 
-        val wrappedCall = object : SimpleForwardingServerCall<ReqT, RespT>(call) {
-            override fun close(status: io.grpc.Status, trailers: Metadata) {
-                if (!status.isOk) {
-                    span.setStatus(StatusCode.ERROR, status.description ?: "")
+        // Guard against double-close: both close() and onCancel() can fire in edge cases
+        val closed = AtomicBoolean(false)
+
+        fun endSpan(status: StatusCode, description: String) {
+            if (closed.compareAndSet(false, true)) {
+                if (status == StatusCode.ERROR) {
+                    span.setStatus(status, description)
                 }
                 span.end()
                 scope.close()
+            }
+        }
+
+        val wrappedCall = object : SimpleForwardingServerCall<ReqT, RespT>(call) {
+            override fun close(status: io.grpc.Status, trailers: Metadata) {
+                val otelStatus = if (status.isOk) StatusCode.OK else StatusCode.ERROR
+                endSpan(otelStatus, status.description ?: "")
                 super.close(status, trailers)
             }
         }
@@ -68,9 +79,7 @@ class OtelGrpcInterceptor(
 
         return object : SimpleForwardingServerCallListener<ReqT>(listener) {
             override fun onCancel() {
-                span.setStatus(StatusCode.ERROR, "Cancelled")
-                span.end()
-                scope.close()
+                endSpan(StatusCode.ERROR, "Cancelled")
                 super.onCancel()
             }
         }
